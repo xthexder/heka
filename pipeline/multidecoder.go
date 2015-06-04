@@ -19,12 +19,13 @@ package pipeline
 import (
 	"errors"
 	"fmt"
-	"github.com/mozilla-services/heka/message"
 	"math/rand"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/mozilla-services/heka/message"
 )
 
 // multiDecoderNode is used for making sure MultiDecoder dependencies are addressed
@@ -158,6 +159,7 @@ type MultiDecoder struct {
 	totalMessageSamples    int64
 	totalMessageDuration   int64
 	idx                    uint8
+	cycleStart             int64
 	sampleDenominator      int
 	sample                 bool
 	reportLock             sync.RWMutex
@@ -178,10 +180,11 @@ type MultiDecoderConfig struct {
 
 const (
 	CASC_FIRST_WINS = iota
+	CASC_CYCLE
 	CASC_ALL
 )
 
-var mdStrategies = map[string]int{"first-wins": CASC_FIRST_WINS, "all": CASC_ALL}
+var mdStrategies = map[string]int{"first-wins": CASC_FIRST_WINS, "cycle": CASC_CYCLE, "all": CASC_ALL}
 
 func (md *MultiDecoder) ConfigStruct() interface{} {
 	subs := make([]string, 0)
@@ -365,28 +368,32 @@ func (md *MultiDecoder) Decode(pack *PipelinePack) (packs []*PipelinePack, err e
 		}()
 	}
 
-	if md.CascStrat == CASC_FIRST_WINS {
+	if md.CascStrat == CASC_FIRST_WINS || md.CascStrat == CASC_CYCLE {
 		var subStartTime time.Time
 
-		for i, d := range md.Decoders {
-			count := atomic.AddInt64(&md.processMessageCount[i], 1)
+		start := 0
+		if md.CascStrat == CASC_CYCLE {
+			start = int(atomic.AddInt64(&md.cycleStart, 1))
+		}
+		for i, _ := range md.Decoders {
+			count := atomic.AddInt64(&md.processMessageCount[(i+start)%len(md.Decoders)], 1)
 			if md.sample || count == 1 {
 				subStartTime = time.Now()
 			}
-			packs, err = d.Decode(pack)
+			packs, err = md.Decoders[(i+start)%len(md.Decoders)].Decode(pack)
 			if md.sample || count == 1 {
 				duration := time.Since(subStartTime).Nanoseconds()
 				md.reportLock.Lock()
-				md.processMessageDuration[i] += duration
-				md.processMessageSamples[i]++
+				md.processMessageDuration[(i+start)%len(md.Decoders)] += duration
+				md.processMessageSamples[(i+start)%len(md.Decoders)]++
 				md.reportLock.Unlock()
 			}
 			if packs != nil {
 				return
 			}
-			atomic.AddInt64(&md.processMessageFailures[i], 1)
+			atomic.AddInt64(&md.processMessageFailures[(i+start)%len(md.Decoders)], 1)
 			if err != nil && md.Config.LogSubErrors {
-				err = fmt.Errorf("Subdecoder '%s' decode error: %s", md.Config.Subs[i],
+				err = fmt.Errorf("Subdecoder '%s' decode error: %s", md.Config.Subs[(i+start)%len(md.Decoders)],
 					err)
 				md.dRunner.LogError(err)
 			}

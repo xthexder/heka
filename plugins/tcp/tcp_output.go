@@ -33,11 +33,13 @@ import (
 type TcpOutput struct {
 	processMessageCount int64
 	dropMessageCount    int64
+	activeServer        int64
+	serverTimeout       []time.Time
 	keepAliveDuration   time.Duration
 	conf                *TcpOutputConfig
-	address             string
+	addresses           []string
 	localAddress        net.Addr
-	connection          net.Conn
+	connections         []net.Conn
 	name                string
 	reportLock          sync.Mutex
 	or                  OutputRunner
@@ -48,7 +50,7 @@ type TcpOutput struct {
 type TcpOutputConfig struct {
 	// String representation of the TCP address to which this output should be
 	// sending data.
-	Address      string
+	Addresses    []string
 	LocalAddress string `toml:"local_address"`
 	UseTls       bool   `toml:"use_tls"`
 	Tls          TlsConfig
@@ -82,7 +84,7 @@ func (t *TcpOutput) ConfigStruct() interface{} {
 		FullAction:        "shutdown",
 	}
 	return &TcpOutputConfig{
-		Address:      "localhost:9125",
+		Addresses:    []string{"localhost:9125"},
 		Encoder:      "ProtobufEncoder",
 		UseBuffering: &b,
 		Buffering:    queueConfig,
@@ -96,7 +98,9 @@ func (t *TcpOutput) SetName(name string) {
 
 func (t *TcpOutput) Init(config interface{}) (err error) {
 	t.conf = config.(*TcpOutputConfig)
-	t.address = t.conf.Address
+	t.addresses = t.conf.Addresses
+	t.connections = make([]net.Conn, len(t.addresses))
+	t.serverTimeout = make([]time.Time, len(t.addresses))
 
 	if t.conf.LocalAddress != "" {
 		// Error out if use_tls and local_address options are both set for now.
@@ -129,57 +133,76 @@ func (t *TcpOutput) Prepare(or OutputRunner, h PluginHelper) (err error) {
 	return nil
 }
 
-func (t *TcpOutput) cleanupConn() {
-	if t.connection != nil {
-		t.connection.Close()
-		t.connection = nil
+func (t *TcpOutput) cleanupConn(i int) {
+	if t.connections[i] != nil {
+		t.connections[i].Close()
+		t.connections[i] = nil
+		t.serverTimeout[i] = time.Now().Add(30 * time.Second)
 	}
 }
 
 func (t *TcpOutput) CleanUp() {
-	t.cleanupConn()
+	for i := range t.connections {
+		t.cleanupConn(i)
+	}
 }
 
 func (t *TcpOutput) ProcessMessage(pack *PipelinePack) (err error) {
-	if t.connection == nil {
-		if err = t.connect(); err != nil {
-			// Explicitly set t.connection to nil because Go, see
-			// http://golang.org/doc/faq#nil_error.
-			t.connection = nil
-			return NewRetryMessageError("can't connect: %s", err)
-		}
-	}
+	defer func() {
+		t.activeServer++
+	}()
 
 	var (
 		n      int
 		record []byte
 	)
+	for attempt := range t.addresses {
+		i := int((t.activeServer + int64(attempt)) % int64(len(t.addresses)))
+		if err != nil {
+			// Print the last error since it won't be returned
+			t.or.LogError(err)
+		}
 
-	if record, err = t.or.Encode(pack); err != nil {
-		atomic.AddInt64(&t.dropMessageCount, 1)
-		return fmt.Errorf("can't encode: %s", err)
-	}
+		if t.connections[i] == nil {
+			if attempt == len(t.addresses)-1 || t.serverTimeout[i].Before(time.Now()) {
+				if err = t.connect(i); err != nil {
+					// Explicitly set t.connections[i] to nil because Go, see
+					// http://golang.org/doc/faq#nil_error.
+					t.connections[i] = nil
+					t.serverTimeout[i] = time.Now().Add(30 * time.Second)
+					err = NewRetryMessageError("can't connect: %s", err)
+				}
+			} else {
+				continue
+			}
+		}
 
-	if n, err = t.connection.Write(record); err != nil {
-		t.cleanupConn()
-		err = NewRetryMessageError("writing to %s: %s", t.address, err)
-	} else if n != len(record) {
-		t.cleanupConn()
-		err = NewRetryMessageError("truncated output to: %s", t.address)
-	} else {
-		atomic.AddInt64(&t.processMessageCount, 1)
-		t.or.UpdateCursor(pack.QueueCursor)
-		if t.conf.ReconnectAfter > 0 &&
-			atomic.LoadInt64(&t.processMessageCount)%t.conf.ReconnectAfter == 0 {
+		if record, err = t.or.Encode(pack); err != nil {
+			atomic.AddInt64(&t.dropMessageCount, 1)
+			return fmt.Errorf("can't encode: %s", err)
+		}
 
-			t.cleanupConn()
+		if n, err = t.connections[i].Write(record); err != nil {
+			t.cleanupConn(i)
+			err = NewRetryMessageError("writing to %s: %s", t.addresses[i], err)
+		} else if n != len(record) {
+			t.cleanupConn(i)
+			err = NewRetryMessageError("truncated output to: %s", t.addresses[i])
+		} else {
+			atomic.AddInt64(&t.processMessageCount, 1)
+			t.or.UpdateCursor(pack.QueueCursor)
+			if t.conf.ReconnectAfter > 0 &&
+				atomic.LoadInt64(&t.processMessageCount)%t.conf.ReconnectAfter == 0 {
+
+				t.cleanupConn(i)
+			}
 		}
 	}
 
 	return err
 }
 
-func (t *TcpOutput) connect() (err error) {
+func (t *TcpOutput) connect(i int) (err error) {
 	dialer := &net.Dialer{LocalAddr: t.localAddress}
 
 	if t.conf.UseTls {
@@ -190,12 +213,12 @@ func (t *TcpOutput) connect() (err error) {
 		// We should use DialWithDialer but its not in GOLANG release yet.
 		// https://code.google.com/p/go/source/detail?r=3d37606fb79393f22a69573afe31f0b0cd4866e3&name=default
 		// t.connection, err = tls.DialWithDialer(dialer, "tcp", t.address, goTlsConf)
-		t.connection, err = tls.Dial("tcp", t.address, goTlsConf)
+		t.connections[i], err = tls.Dial("tcp", t.addresses[i], goTlsConf)
 	} else {
-		t.connection, err = dialer.Dial("tcp", t.address)
+		t.connections[i], err = dialer.Dial("tcp", t.addresses[i])
 	}
 	if err == nil && t.conf.KeepAlive {
-		tcpConn, ok := t.connection.(*net.TCPConn)
+		tcpConn, ok := t.connections[i].(*net.TCPConn)
 		if !ok {
 			t.or.LogError(fmt.Errorf("KeepAlive only supported for TCP Connections."))
 		} else {
