@@ -21,19 +21,21 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/mozilla-services/heka/message"
-	. "github.com/mozilla-services/heka/pipeline"
-	"github.com/mozilla-services/heka/plugins/tcp"
 	"io/ioutil"
 	"net"
 	"net/http"
 	"net/url"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/mozilla-services/heka/message"
+	. "github.com/mozilla-services/heka/pipeline"
+	"github.com/mozilla-services/heka/plugins/tcp"
 )
 
 type ESBatch struct {
@@ -57,6 +59,7 @@ type ElasticSearchOutput struct {
 	reportLock          sync.Mutex
 	outputExit          chan error
 	outputError         chan error
+	nextRouteRefresh    time.Time
 }
 
 // ConfigStruct for ElasticSearchOutput plugin.
@@ -100,6 +103,8 @@ type ElasticSearchOutputConfig struct {
 	// Specifies action which should be executed if queue is full. Possible
 	// values are "shutdown", "drop", or "block".
 	QueueFullAction string `toml:"queue_full_action"`
+	// Whether or not to force routing to occur on the local machine / indexer
+	ForceLocal bool `toml:"force_local"`
 }
 
 func (o *ElasticSearchOutput) ConfigStruct() interface{} {
@@ -115,6 +120,7 @@ func (o *ElasticSearchOutput) ConfigStruct() interface{} {
 		UseBuffering:          true,
 		QueueMaxBufferSize:    0,
 		QueueFullAction:       "shutdown",
+		ForceLocal:            false,
 	}
 }
 
@@ -130,6 +136,10 @@ func (o *ElasticSearchOutput) Init(config interface{}) (err error) {
 	}
 
 	o.outputExit = make(chan error)
+
+	if o.conf.ForceLocal {
+		o.nextRouteRefresh = time.Now()
+	}
 
 	var serverUrl *url.URL
 	if serverUrl, err = url.Parse(o.conf.Server); err == nil {
@@ -361,6 +371,15 @@ func (o *ElasticSearchOutput) queueFull(buffer []byte, count int64) bool {
 
 func (o *ElasticSearchOutput) SendRecord(buffer []byte) (err error) {
 	var retry bool
+	if !o.nextRouteRefresh.IsZero() && !o.nextRouteRefresh.After(time.Now()) {
+		err = o.bulkIndexer.RefreshRouting()
+		if err != nil {
+			return err
+		} else {
+			o.nextRouteRefresh = time.Now().Add(30 * time.Second)
+		}
+	}
+
 	err, retry = o.bulkIndexer.Index(buffer)
 	if err != nil {
 		if retry {
@@ -394,6 +413,8 @@ type BulkIndexer interface {
 	Index(body []byte) (err error, retry bool)
 	// Check if a flush is needed
 	CheckFlush(count int, length int) bool
+	// Refresh route hash for local node
+	RefreshRouting() (err error)
 }
 
 // A HttpBulkIndexer uses the HTTP REST Bulk Api of ElasticSearch
@@ -411,6 +432,8 @@ type HttpBulkIndexer struct {
 	username string
 	// Optional password for HTTP authentication
 	password string
+	// Optional routing parameter
+	routing string
 }
 
 func NewHttpBulkIndexer(protocol string, domain string, maxCount int,
@@ -451,6 +474,9 @@ func (h *HttpBulkIndexer) Index(body []byte) (err error, retry bool) {
 	var response_body_json map[string]interface{}
 
 	url := fmt.Sprintf("%s://%s%s", h.Protocol, h.Domain, "/_bulk")
+	if len(h.routing) > 0 {
+		url += "?routing=" + h.routing
+	}
 
 	// Creating ElasticSearch Bulk HTTP request
 	request, err := http.NewRequest("POST", url, bytes.NewReader(body))
@@ -495,6 +521,60 @@ func (h *HttpBulkIndexer) Index(body []byte) (err error, retry bool) {
 		}
 	}
 	return nil, false
+}
+
+func (h *HttpBulkIndexer) RefreshRouting() (err error) {
+	for route := 0; route < 100; route++ {
+		var response_body []byte
+		var response_body_json map[string]interface{}
+
+		url := fmt.Sprintf("%s://%s%s", h.Protocol, h.Domain, "/_search_shards?local=true&routing=%d", route)
+
+		request, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			return fmt.Errorf("Can't create shard search request: %s", err.Error())
+		}
+		request.Header.Add("Accept", "application/json")
+		if h.username != "" && h.password != "" {
+			request.SetBasicAuth(h.username, h.password)
+		}
+
+		request_start_time := time.Now()
+		response, err := h.client.Do(request)
+		request_time := time.Since(request_start_time)
+		if err != nil {
+			if (h.client.Timeout > 0) && (request_time >= h.client.Timeout) &&
+				(strings.Contains(err.Error(), "use of closed network connection")) {
+
+				return fmt.Errorf("HTTP request was interrupted after timeout. It lasted %s",
+					request_time.String())
+			} else {
+				return fmt.Errorf("HTTP request failed: %s", err.Error())
+			}
+		}
+		defer response.Body.Close()
+		if response.StatusCode > 304 {
+			return fmt.Errorf("HTTP response error status: %s", response.Status)
+		}
+		if response_body, err = ioutil.ReadAll(response.Body); err != nil {
+			return fmt.Errorf("Can't read HTTP response body: %s", err.Error())
+		}
+		err = json.Unmarshal(response_body, &response_body_json)
+		if err != nil {
+			return fmt.Errorf("HTTP response didn't contain valid JSON. Body: %s",
+				string(response_body))
+		}
+		json_errors, ok := response_body_json["errors"].(bool)
+		if ok && json_errors {
+			return fmt.Errorf("ElasticSearch server reported error within JSON: %s",
+				string(response_body))
+		}
+		if strings.Contains(string(response_body), "inet[/"+strings.SplitAfterN(h.Domain, ":", 2)[0]) {
+			h.routing = strconv.Itoa(route)
+			return nil
+		}
+	}
+	return fmt.Errorf("A local route wasn't found after 100 iterations.")
 }
 
 // A UDPBulkIndexer uses the Bulk UDP Api of ElasticSearch
@@ -544,6 +624,11 @@ func (u *UDPBulkIndexer) Index(body []byte) (err error, retry bool) {
 		return fmt.Errorf("Error writing data to UDP server, address not found"), true
 	}
 	return nil, false
+}
+
+func (h *UDPBulkIndexer) RefreshRouting() (err error) {
+	// Not supported
+	return nil
 }
 
 func init() {
