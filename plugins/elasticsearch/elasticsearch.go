@@ -528,7 +528,7 @@ func (h *HttpBulkIndexer) RefreshRouting() (err error) {
 		var response_body []byte
 		var response_body_json map[string]interface{}
 
-		url := fmt.Sprintf("%s://%s%s", h.Protocol, h.Domain, "/_search_shards?local=true&routing=%d", route)
+		url := fmt.Sprintf("%s://%s/_search_shards?local=true&routing=%d", h.Protocol, h.Domain, route)
 
 		request, err := http.NewRequest("GET", url, nil)
 		if err != nil {
@@ -574,7 +574,8 @@ func (h *HttpBulkIndexer) RefreshRouting() (err error) {
 			return nil
 		}
 	}
-	return fmt.Errorf("A local route wasn't found after 100 iterations.")
+	// A local route wasn't found after 100 iterations, skip it for now
+	return nil
 }
 
 // A UDPBulkIndexer uses the Bulk UDP Api of ElasticSearch
