@@ -19,15 +19,20 @@ import (
 	"bytes"
 	"encoding/base64"
 	"fmt"
-	"github.com/mozilla-services/heka/message"
-	. "github.com/mozilla-services/heka/pipeline"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/mozilla-services/heka/message"
+	. "github.com/mozilla-services/heka/pipeline"
 )
 
 const lowerhex = "0123456789abcdef"
 const NEWLINE byte = 10
+
+type ESIndexNamer interface {
+	GetIndexName(*message.Message) (string, error)
+}
 
 func writeUTF16Escape(b *bytes.Buffer, c rune) {
 	b.WriteString(`\u`)
@@ -348,6 +353,10 @@ func (e *ESJsonEncoder) Encode(pack *PipelinePack) (output []byte, err error) {
 	return buf.Bytes(), err
 }
 
+func (e *ESJsonEncoder) GetIndexName(msg *message.Message) (string, error) {
+	return interpolateFlag(e.coord, msg, e.coord.Index)
+}
+
 // Manually encodes messages into JSON structure matching Logstash's "version
 // 1" schema, for compatibility with Kibana's out-of-box Logstash dashboards.
 type ESLogstashV0Encoder struct {
@@ -489,6 +498,10 @@ func (e *ESLogstashV0Encoder) Encode(pack *PipelinePack) (output []byte, err err
 	buf.WriteString(`}`)
 	buf.WriteByte(NEWLINE)
 	return buf.Bytes(), err
+}
+
+func (e *ESLogstashV0Encoder) GetIndexName(msg *message.Message) (string, error) {
+	return interpolateFlag(e.coord, msg, e.coord.Index)
 }
 
 func init() {

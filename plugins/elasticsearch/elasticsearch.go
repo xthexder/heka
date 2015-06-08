@@ -60,6 +60,7 @@ type ElasticSearchOutput struct {
 	outputExit          chan error
 	outputError         chan error
 	nextRouteRefresh    time.Time
+	lastIndex           chan string
 }
 
 // ConfigStruct for ElasticSearchOutput plugin.
@@ -139,6 +140,7 @@ func (o *ElasticSearchOutput) Init(config interface{}) (err error) {
 
 	if o.conf.ForceLocal {
 		o.nextRouteRefresh = time.Now()
+		o.lastIndex = make(chan string)
 	}
 
 	var serverUrl *url.URL
@@ -203,15 +205,16 @@ func (o *ElasticSearchOutput) sendBatch(outBatch []byte, count int64) (nextBatch
 
 func (o *ElasticSearchOutput) Run(or OutputRunner, h PluginHelper) (err error) {
 	var (
-		ok       = true
-		pack     *PipelinePack
-		inChan   = or.InChan()
-		count    int64
-		e        error
-		outBytes []byte
-		stopChan = make(chan bool, 1)
-		outBatch = make([]byte, 0, 10000)
-		ticker   = time.Tick(time.Duration(o.conf.FlushInterval) * time.Millisecond)
+		ok        = true
+		pack      *PipelinePack
+		inChan    = or.InChan()
+		count     int64
+		e         error
+		outBytes  []byte
+		stopChan  = make(chan bool, 1)
+		outBatch  = make([]byte, 0, 10000)
+		ticker    = time.Tick(time.Duration(o.conf.FlushInterval) * time.Millisecond)
+		indexChan = make(chan string, 10)
 	)
 
 	o.outputError = make(chan error, 5)
@@ -249,6 +252,20 @@ func (o *ElasticSearchOutput) Run(or OutputRunner, h PluginHelper) (err error) {
 		go o.committer()
 	}
 
+	if o.conf.ForceLocal {
+		go func() {
+			var index string = "_all"
+			for {
+				select {
+				case newIndex := <-indexChan:
+					index = newIndex
+				case o.lastIndex <- index:
+				}
+
+			}
+		}()
+	}
+
 	for ok {
 		select {
 		case e := <-o.outputError:
@@ -274,6 +291,14 @@ func (o *ElasticSearchOutput) Run(or OutputRunner, h PluginHelper) (err error) {
 			}
 
 			outBytes, e = or.Encode(pack)
+			if len(outBytes) > 0 && count == 0 {
+				if namer, ok2 := or.Encoder().(ESIndexNamer); ok2 {
+					tmpindex, err := namer.GetIndexName(pack.Message)
+					if err == nil {
+						indexChan <- tmpindex
+					}
+				}
+			}
 			pack.Recycle()
 			if e != nil {
 				or.LogError(e)
@@ -372,7 +397,7 @@ func (o *ElasticSearchOutput) queueFull(buffer []byte, count int64) bool {
 func (o *ElasticSearchOutput) SendRecord(buffer []byte) (err error) {
 	var retry bool
 	if !o.nextRouteRefresh.IsZero() && !o.nextRouteRefresh.After(time.Now()) {
-		err = o.bulkIndexer.RefreshRouting()
+		err = o.bulkIndexer.RefreshRouting(<-o.lastIndex)
 		if err != nil {
 			return err
 		} else {
@@ -414,7 +439,7 @@ type BulkIndexer interface {
 	// Check if a flush is needed
 	CheckFlush(count int, length int) bool
 	// Refresh route hash for local node
-	RefreshRouting() (err error)
+	RefreshRouting(index string) (err error)
 }
 
 // A HttpBulkIndexer uses the HTTP REST Bulk Api of ElasticSearch
@@ -434,6 +459,8 @@ type HttpBulkIndexer struct {
 	password string
 	// Optional routing parameter
 	routing string
+	// Index to be used for refreshing routing parameter
+	index string
 }
 
 func NewHttpBulkIndexer(protocol string, domain string, maxCount int,
@@ -459,6 +486,7 @@ func NewHttpBulkIndexer(protocol string, domain string, maxCount int,
 		client:   client,
 		username: username,
 		password: password,
+		index:    "_all",
 	}
 }
 
@@ -523,12 +551,12 @@ func (h *HttpBulkIndexer) Index(body []byte) (err error, retry bool) {
 	return nil, false
 }
 
-func (h *HttpBulkIndexer) RefreshRouting() (err error) {
+func (h *HttpBulkIndexer) RefreshRouting(index string) (err error) {
 	for route := 0; route < 100; route++ {
 		var response_body []byte
 		var response_body_json map[string]interface{}
 
-		url := fmt.Sprintf("%s://%s/_search_shards?local=true&routing=%d", h.Protocol, h.Domain, route)
+		url := fmt.Sprintf("%s://%s/%s/_search_shards?local=true&routing=%d", h.Protocol, h.Domain, url.QueryEscape(index), route)
 
 		request, err := http.NewRequest("GET", url, nil)
 		if err != nil {
@@ -576,6 +604,10 @@ func (h *HttpBulkIndexer) RefreshRouting() (err error) {
 	}
 	// A local route wasn't found after 100 iterations, skip it for now
 	return nil
+}
+
+func (h *HttpBulkIndexer) SetIndex(index string) {
+	h.index = index
 }
 
 // A UDPBulkIndexer uses the Bulk UDP Api of ElasticSearch
@@ -627,7 +659,7 @@ func (u *UDPBulkIndexer) Index(body []byte) (err error, retry bool) {
 	return nil, false
 }
 
-func (h *UDPBulkIndexer) RefreshRouting() (err error) {
+func (h *UDPBulkIndexer) RefreshRouting(index string) (err error) {
 	// Not supported
 	return nil
 }
