@@ -19,25 +19,28 @@ package tcp
 import (
 	"crypto/tls"
 	"fmt"
-	"github.com/mozilla-services/heka/message"
-	. "github.com/mozilla-services/heka/pipeline"
 	"net"
 	"regexp"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/mozilla-services/heka/message"
+	. "github.com/mozilla-services/heka/pipeline"
 )
 
 // Output plugin that sends messages via TCP using the Heka protocol.
 type TcpOutput struct {
 	processMessageCount int64
 	dropMessageCount    int64
+	activeServer        int64
+	serverTimeout       []time.Time
 	keepAliveDuration   time.Duration
 	conf                *TcpOutputConfig
-	address             string
+	addresses           []string
 	localAddress        net.Addr
-	connection          net.Conn
+	connections         []net.Conn
 	name                string
 	reportLock          sync.Mutex
 	bufferedOut         *BufferedOutput
@@ -50,7 +53,7 @@ type TcpOutput struct {
 type TcpOutputConfig struct {
 	// String representation of the TCP address to which this output should be
 	// sending data.
-	Address      string
+	Addresses    []string
 	LocalAddress string `toml:"local_address"`
 	UseTls       bool   `toml:"use_tls"`
 	Tls          TlsConfig
@@ -77,7 +80,7 @@ type TcpOutputConfig struct {
 
 func (t *TcpOutput) ConfigStruct() interface{} {
 	return &TcpOutputConfig{
-		Address:            "localhost:9125",
+		Addresses:          []string{"localhost:9125"},
 		TickerInterval:     uint(300),
 		Encoder:            "ProtobufEncoder",
 		QueueMaxBufferSize: 0,
@@ -92,7 +95,9 @@ func (t *TcpOutput) SetName(name string) {
 
 func (t *TcpOutput) Init(config interface{}) (err error) {
 	t.conf = config.(*TcpOutputConfig)
-	t.address = t.conf.Address
+	t.addresses = t.conf.Addresses
+	t.connections = make([]net.Conn, len(t.addresses))
+	t.serverTimeout = make([]time.Time, len(t.addresses))
 
 	if t.conf.LocalAddress != "" {
 		// Error out if use_tls and local_address options are both set for now.
@@ -116,7 +121,7 @@ func (t *TcpOutput) Init(config interface{}) (err error) {
 	return
 }
 
-func (t *TcpOutput) connect() (err error) {
+func (t *TcpOutput) connect(i int) (err error) {
 	dialer := &net.Dialer{LocalAddr: t.localAddress}
 
 	if t.conf.UseTls {
@@ -124,15 +129,12 @@ func (t *TcpOutput) connect() (err error) {
 		if goTlsConf, err = CreateGoTlsConfig(&t.conf.Tls); err != nil {
 			return fmt.Errorf("TLS init error: %s", err)
 		}
-		// We should use DialWithDialer but its not in GOLANG release yet.
-		// https://code.google.com/p/go/source/detail?r=3d37606fb79393f22a69573afe31f0b0cd4866e3&name=default
-		// t.connection, err = tls.DialWithDialer(dialer, "tcp", t.address, goTlsConf)
-		t.connection, err = tls.Dial("tcp", t.address, goTlsConf)
+		t.connections[i], err = tls.DialWithDialer(dialer, "tcp", t.addresses[i], goTlsConf)
 	} else {
-		t.connection, err = dialer.Dial("tcp", t.address)
+		t.connections[i], err = dialer.Dial("tcp", t.addresses[i])
 	}
-	if t.connection != nil && t.conf.KeepAlive {
-		tcpConn, ok := t.connection.(*net.TCPConn)
+	if t.connections[i] != nil && t.conf.KeepAlive {
+		tcpConn, ok := t.connections[i].(*net.TCPConn)
 		if !ok {
 			t.or.LogError(fmt.Errorf("KeepAlive only supported for TCP Connections."))
 		} else {
@@ -146,32 +148,52 @@ func (t *TcpOutput) connect() (err error) {
 }
 
 func (t *TcpOutput) SendRecord(record []byte) (err error) {
-	var n int
+	defer func() {
+		t.activeServer++
+	}()
 
-	if t.connection == nil {
-		if err = t.connect(); err != nil {
-			// Explicitly set t.connection to nil because Go, see
-			// http://golang.org/doc/faq#nil_error.
-			t.connection = nil
+	var n int
+	for attempt := range t.addresses {
+		i := int((t.activeServer + int64(attempt)) % int64(len(t.addresses)))
+		if err != nil {
+			// Print the last error since it won't be returned
+			t.or.LogError(err)
+		}
+
+		if t.connections[i] == nil {
+			if attempt == len(t.addresses)-1 || t.serverTimeout[i].Before(time.Now()) {
+				if err = t.connect(i); err != nil {
+					// Explicitly set t.connections[i] to nil because Go, see
+					// http://golang.org/doc/faq#nil_error.
+					t.connections[i] = nil
+					t.serverTimeout[i] = time.Now().Add(30 * time.Second)
+					return
+				}
+			} else {
+				continue
+			}
+		}
+
+		cleanupConn := func() {
+			if t.connections[i] != nil {
+				t.connections[i].Close()
+				t.connections[i] = nil
+				t.serverTimeout[i] = time.Now().Add(30 * time.Second)
+			}
+		}
+
+		if n, err = t.connections[i].Write(record); err != nil {
+			cleanupConn()
+			err = fmt.Errorf("writing to %s: %s", t.addresses[i], err)
+		} else if n != len(record) {
+			cleanupConn()
+			err = fmt.Errorf("truncated output to: %s", t.addresses[i])
+			return
+		}
+		if err == nil {
 			return
 		}
 	}
-
-	cleanupConn := func() {
-		if t.connection != nil {
-			t.connection.Close()
-			t.connection = nil
-		}
-	}
-
-	if n, err = t.connection.Write(record); err != nil {
-		cleanupConn()
-		err = fmt.Errorf("writing to %s: %s", t.address, err)
-	} else if n != len(record) {
-		cleanupConn()
-		err = fmt.Errorf("truncated output to: %s", t.address)
-	}
-
 	return
 }
 
@@ -206,9 +228,11 @@ func (t *TcpOutput) Run(or OutputRunner, h PluginHelper) (err error) {
 	t.or = or
 
 	defer func() {
-		if t.connection != nil {
-			t.connection.Close()
-			t.connection = nil
+		for i := range t.connections {
+			if t.connections[i] != nil {
+				t.connections[i].Close()
+				t.connections[i] = nil
+			}
 		}
 	}()
 
